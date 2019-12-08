@@ -33,6 +33,7 @@
 #include "HttpDebugNames.h"
 #include <ctime>
 #include "tscore/ParseRules.h"
+#include "tscore/Filenames.h"
 #include "HTTP.h"
 #include "HdrUtils.h"
 #include "logging/Log.h"
@@ -1817,11 +1818,6 @@ HttpTransact::DecideCacheLookup(State *s)
     }
   }
 
-  if (service_transaction_in_proxy_only_mode(s)) {
-    s->cache_info.action = CACHE_DO_NO_ACTION;
-    s->current.mode      = TUNNELLING_PROXY;
-    HTTP_INCREMENT_DYN_STAT(http_throttled_proxy_only_stat);
-  }
   // at this point the request is ready to continue down the
   // traffic server path.
 
@@ -6061,8 +6057,8 @@ HttpTransact::is_response_cacheable(State *s, HTTPHdr *request, HTTPHdr *respons
     // If a ttl is set, allow caching even if response contains
     // Cache-Control headers to prevent caching
     if (s->cache_control.ttl_in_cache > 0) {
-      TxnDebug("http_trans",
-               "[is_response_cacheable] Cache-control header directives in response overridden by ttl in cache.config");
+      TxnDebug("http_trans", "[is_response_cacheable] Cache-control header directives in response overridden by ttl in %s",
+               ts::filename::CACHE);
     } else {
       TxnDebug("http_trans", "[is_response_cacheable] NO by response cache control");
       return false;
@@ -6323,28 +6319,6 @@ HttpTransact::is_response_valid(State *s, HTTPHdr *incoming_response)
     s->current.state = BAD_INCOMING_RESPONSE;
     return false;
   }
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Name       : service_transaction_in_proxy_only_mode
-// Description: uses some metric to force this transaction to be proxy-only
-//
-// Details    :
-//
-// Some metric may be employed to force the traffic server to enter
-// a proxy-only mode temporarily. This function is called to determine
-// if the current transaction should be proxy-only. The function is
-// called from initialize_state_variables_from_request and is used to
-// set s->current.mode to TUNNELLING_PROXY and just for safety to set
-// s->cache_info.action to CACHE_DO_NO_ACTION.
-//
-// Currently the function is just a placeholder and always returns false.
-//
-///////////////////////////////////////////////////////////////////////////////
-bool
-HttpTransact::service_transaction_in_proxy_only_mode(State * /* s ATS_UNUSED */)
-{
-  return false;
 }
 
 void
@@ -6757,11 +6731,10 @@ HttpTransact::handle_response_keep_alive_headers(State *s, HTTPVersion ver, HTTP
     // to the client to keep the connection alive.
     // Insert a Transfer-Encoding header in the response if necessary.
 
-    // check that the client is HTTP 1.1 and the conf allows chunking or the client
-    // protocol unchunks before returning to the user agent (i.e. is http/2)
-    if (s->client_info.http_version == HTTPVersion(1, 1) &&
-        (s->txn_conf->chunking_enabled == 1 ||
-         (s->state_machine->plugin_tag && (!strncmp(s->state_machine->plugin_tag, "http/2", 6)))) &&
+    // check that the client protocol is HTTP/1.1 and the conf allows chunking or
+    // the client protocol doesn't support chunked transfer coding (i.e. HTTP/1.0, HTTP/2, and HTTP/3)
+    if (s->state_machine->ua_txn && s->state_machine->ua_txn->is_chunked_encoding_supported() &&
+        s->client_info.http_version == HTTPVersion(1, 1) && s->txn_conf->chunking_enabled == 1 &&
         // if we're not sending a body, don't set a chunked header regardless of server response
         !is_response_body_precluded(s->hdr_info.client_response.status_get(), s->method) &&
         // we do not need chunked encoding for internal error messages
@@ -6794,10 +6767,12 @@ HttpTransact::handle_response_keep_alive_headers(State *s, HTTPVersion ver, HTTP
 
     // Close the connection if client_info is not keep-alive.
     // Otherwise, if we cannot trust the content length, we will close the connection
-    // unless we are going to use chunked encoding or the client issued
-    // a PUSH request
+    // unless we are going to use chunked encoding on HTTP/1.1 or the client issued a PUSH request
     if (s->client_info.keep_alive != HTTP_KEEPALIVE) {
       ka_action = KA_DISABLED;
+    } else if (s->state_machine->client_protocol && (IP_PROTO_TAG_HTTP_3.compare(s->state_machine->client_protocol) == 0 ||
+                                                     strncmp(s->state_machine->client_protocol, "http/2", 6) == 0)) {
+      ka_action = KA_CONNECTION;
     } else if (s->hdr_info.trust_response_cl == false &&
                !(s->client_info.receive_chunked_response == true ||
                  (s->method == HTTP_WKSIDX_PUSH && s->client_info.keep_alive == HTTP_KEEPALIVE))) {
@@ -7985,24 +7960,6 @@ HttpTransact::build_redirect_response(State *s)
   h->value_set(MIME_FIELD_CONTENT_TYPE, MIME_LEN_CONTENT_TYPE, "text/html", 9);
 
   s->arena.str_free(to_free);
-}
-
-void
-HttpTransact::build_upgrade_response(State *s)
-{
-  TxnDebug("http_upgrade", "[HttpTransact::build_upgrade_response]");
-
-  // 101 Switching Protocols
-  HTTPStatus status_code    = HTTP_STATUS_SWITCHING_PROTOCOL;
-  const char *reason_phrase = http_hdr_reason_lookup(status_code);
-  build_response(s, &s->hdr_info.client_response, s->client_info.http_version, status_code, reason_phrase);
-
-  //////////////////////////
-  // set upgrade headers  //
-  //////////////////////////
-  HTTPHdr *h = &s->hdr_info.client_response;
-  h->value_set(MIME_FIELD_CONNECTION, MIME_LEN_CONNECTION, "Upgrade", strlen("Upgrade"));
-  h->value_set(MIME_FIELD_UPGRADE, MIME_LEN_UPGRADE, MIME_UPGRADE_H2C_TOKEN, strlen(MIME_UPGRADE_H2C_TOKEN));
 }
 
 const char *

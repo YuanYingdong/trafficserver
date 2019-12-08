@@ -44,6 +44,7 @@
 #include "IPAllow.h"
 #include "tscore/I_Layout.h"
 #include "tscore/bwf_std_format.h"
+#include "ts/sdt.h"
 
 #include <openssl/ossl_typ.h>
 #include <openssl/ssl.h>
@@ -1711,6 +1712,8 @@ HttpSM::state_http_server_open(int event, void *data)
     pending_action = nullptr;
 
     session->new_connection(vc);
+
+    ATS_PROBE1(new_origin_server_connection, t_state.current.server->name);
 
     session->state = HSS_ACTIVE;
     ats_ip_copy(&t_state.server_info.src_addr, netvc->get_local_addr());
@@ -5004,6 +5007,17 @@ HttpSM::do_http_server_open(bool raw)
     if (t_state.txn_conf->ssl_client_sni_policy != nullptr && !strcmp(t_state.txn_conf->ssl_client_sni_policy, "remap")) {
       len = strlen(t_state.server_info.name);
       opt.set_sni_servername(t_state.server_info.name, len);
+    } else if (t_state.txn_conf->ssl_client_sni_policy != nullptr &&
+               !strcmp(t_state.txn_conf->ssl_client_sni_policy, "verify_with_name_source")) {
+      // the same with "remap" policy to set sni_servername
+      len = strlen(t_state.server_info.name);
+      opt.set_sni_servername(t_state.server_info.name, len);
+
+      // also set sni_hostname with host header from server request in this policy
+      const char *host = t_state.hdr_info.server_request.host_get(&len);
+      if (host && len > 0) {
+        opt.set_sni_hostname(host, len);
+      }
     } else { // Do the default of host header for SNI
       const char *host = t_state.hdr_info.server_request.host_get(&len);
       if (host && len > 0) {
